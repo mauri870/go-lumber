@@ -33,7 +33,9 @@ type AsyncClient struct {
 
 	inflight int
 	ch       chan ackMessage
+	done     chan struct{}
 	wg       sync.WaitGroup
+	mu       sync.Mutex // protects access to the underlying client
 }
 
 type ackMessage struct {
@@ -107,7 +109,9 @@ func AsyncDialWith(
 // The client gives no guarantees regarding published events. There is a chance
 // events will be processed by server, even though connection has been closed.
 func (c *AsyncClient) Close() error {
+	c.mu.Lock()
 	err := c.cl.Close()
+	c.mu.Unlock()
 	c.stopACK()
 	return err
 }
@@ -117,31 +121,54 @@ func (c *AsyncClient) Close() error {
 // Upon completion cb will be called with last ACKed index into active batch.
 // Returns error if communication or serialization to JSON failed.
 func (c *AsyncClient) Send(cb AsyncSendCallback, data []interface{}) error {
-	if err := c.cl.Send(data); err != nil {
-		c.ch <- ackMessage{
+	c.mu.Lock()
+	err := c.cl.Send(data)
+	c.mu.Unlock()
+	
+	if err != nil {
+		c.trySend(ackMessage{
 			seq: 0,
 			cb:  cb,
 			err: err,
-		}
+		})
 		return err
 	}
 
-	c.ch <- ackMessage{
+	c.trySend(ackMessage{
 		seq: uint32(len(data)),
 		cb:  cb,
 		err: nil,
-	}
+	})
 	return nil
+}
+
+// trySend sends msg unless the client is closed.
+func (c *AsyncClient) trySend(msg ackMessage) {
+	select {
+	case c.ch <- msg:
+	case <-c.done:
+		// Client is closed, call callback with error
+		if msg.cb != nil {
+			msg.cb(0, io.EOF)
+		}
+	}
 }
 
 func (c *AsyncClient) startACK() {
 	c.ch = make(chan ackMessage, c.inflight)
+	c.done = make(chan struct{})
 	c.wg.Add(1)
 	go c.ackLoop()
 }
 
 func (c *AsyncClient) stopACK() {
-	close(c.ch)
+	select {
+	case <-c.done:
+		// already closed
+		return
+	default:
+		close(c.done)
+	}
 	c.wg.Wait()
 }
 
@@ -154,26 +181,40 @@ func (c *AsyncClient) ackLoop() {
 		if err == nil {
 			err = io.EOF
 		}
-		for msg := range c.ch {
-			if msg.err != nil {
-				err = msg.err
+		for {
+			select {
+			case msg := <-c.ch:
+				if msg.err != nil {
+					err = msg.err
+				}
+				msg.cb(0, err)
+			case <-c.done:
+				return
 			}
-			msg.cb(0, err)
 		}
 	}()
 	defer c.wg.Done()
 
-	for msg := range c.ch {
-		if msg.err != nil {
-			err = msg.err
-			msg.cb(msg.seq, msg.err)
-			return
-		}
+	for {
+		select {
+		case msg := <-c.ch:
+			if msg.err != nil {
+				err = msg.err
+				msg.cb(msg.seq, msg.err)
+				return
+			}
 
-		seq, err = c.cl.AwaitACK(msg.seq)
-		msg.cb(seq, err)
-		if err != nil {
-			c.cl.Close()
+			c.mu.Lock()
+			seq, err = c.cl.AwaitACK(msg.seq)
+			c.mu.Unlock()
+			msg.cb(seq, err)
+			if err != nil {
+				c.mu.Lock()
+				c.cl.Close()
+				c.mu.Unlock()
+				return
+			}
+		case <-c.done:
 			return
 		}
 	}
